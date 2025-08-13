@@ -3,7 +3,7 @@ name = "ecg_backend"
 version = "0.1.0"
 description = "Backend for ECG analysis."
 authors = ["Your Name <you@example.com>"]
-readme = "README.md"
+
 
 [tool.poetry.dependencies]
 python = "~3.11"  # This line replaces your runtime.txt file
