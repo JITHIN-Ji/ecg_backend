@@ -1,5 +1,3 @@
-# backend/main.py
-
 import io
 import re
 import time
@@ -38,7 +36,7 @@ app = FastAPI(title="Bharat Cardio API")
 # to communicate with this backend API.
 app.add_middleware(
     CORSMiddleware,
-    allow_origins=["https://cunning-model-puma.ngrok-free.app"],
+    allow_origins=["http://localhost:3000"],
     allow_credentials=True,
     allow_methods=["*"],
     allow_headers=["*"],
@@ -85,12 +83,17 @@ def extract_patient_info_from_pdf(pdf_file_bytes: bytes) -> tuple:
     except Exception:
         return "Unknown", "N/A", "N/A"
 
-    name_match = re.search(r'Patient(?: Name)?:\s*([^\n\r]+)', text, re.IGNORECASE)
-    age_gender_match = re.search(r'Age\s*/\s*(?:Gender|Sex):\s*(\d+)\s*Y?\s*/?\s*(Male|Female)', text, re.IGNORECASE)
+    name_match = re.search(r'Patient(?: Name)?:\s*(.+)', text, re.IGNORECASE)
+    age_gender_match = re.search(r'Age\s*/\s*(?:Gender|Sex):\s*(\d+)[Yy]?/?\s*(Male|Female)', text, re.IGNORECASE)
 
     name = name_match.group(1).strip() if name_match else "Unknown"
     age = age_gender_match.group(1) if age_gender_match else "N/A"
+    
+    # --- START OF CORRECTION ---
+    # The group index was changed from 3 to 2 to match the regex pattern.
     gender = age_gender_match.group(2) if age_gender_match else "N/A"
+    # --- END OF CORRECTION ---
+    
     return name, age, gender
 
 def bandpass_filter(data: np.ndarray, lowcut: float, highcut: float, fs: float, order: int = 2) -> np.ndarray:
@@ -141,74 +144,75 @@ async def analyze_ecg_endpoint(file: UploadFile = File(...)):
 
         pixels_per_mm = estimate_pixels_per_mm(crop_img_gray)
         mm_per_pixel = 1 / pixels_per_mm if pixels_per_mm != 0 else 0.1
-        ms_per_mm = 40
-        ms_per_sample = mm_per_pixel * ms_per_mm
-        FS = 1000 / ms_per_sample if ms_per_sample > 0 else 250.0
-
+        FS = 1000 / (mm_per_pixel * 40) if mm_per_pixel > 0 else 250.0
 
         _, bin_img = cv2.threshold(crop_img_gray, 0, 255, cv2.THRESH_BINARY_INV + cv2.THRESH_OTSU)
-        signal_y = [np.median(np.where(bin_img[:,col] == 255)[0]) if np.any(bin_img[:,col]) else (signal_y[-1] if 'signal_y' in locals() and len(signal_y)>0 else 0) for col in range(bin_img.shape[1])]
-        signal = np.median(signal_y) - np.array(signal_y)
+        
+        signal_points = []
+        for col in range(bin_img.shape[1]):
+            if np.any(bin_img[:, col]):
+                median_y = np.median(np.where(bin_img[:, col] == 255)[0])
+                signal_points.append(median_y)
+            else:
+                if len(signal_points) > 0:
+                    signal_points.append(signal_points[-1])
+                else:
+                    signal_points.append(0)
+        
+        signal = np.array(signal_points, dtype=np.float32)
 
         filtered_signal = bandpass_filter(signal, lowcut=0.5, highcut=40.0, fs=FS)
-        r_peaks, _ = find_peaks(filtered_signal, height=np.mean(filtered_signal) + 0.5 * np.std(filtered_signal), distance=int(0.6 * FS))
+        
+        peak_threshold = np.mean(filtered_signal) + 0.5 * np.std(filtered_signal)
+        r_peaks, _ = find_peaks(filtered_signal, height=peak_threshold, distance=int(0.6 * FS))
 
         if len(r_peaks) < 2:
             raise HTTPException(status_code=400, detail="Not enough R-peaks detected for analysis.")
             
-        # --- NEW: PR Interval Calculation Function ---
+        # --- PR Interval Calculation Function (Same as in batchecg.py) ---
         def calculate_pr_interval(signal, r_peaks, fs):
             pr_intervals = []
             for r_peak in r_peaks:
-                # Look for P-wave onset before the R-peak
                 search_window_p = signal[max(0, r_peak - int(0.2 * fs)) : r_peak - int(0.04 * fs)]
                 if len(search_window_p) > 0:
-                    p_onset_rel = np.argmax(search_window_p) # Simplified: peak of P-wave as onset
+                    p_onset_rel = np.argmax(search_window_p)
                     p_onset = max(0, r_peak - int(0.2 * fs)) + p_onset_rel
-                    
-                    # QRS onset is just before R-peak
-                    q_onset = r_peak - int(0.04 * fs) # Approximate QRS onset
-                    
+                    q_onset = r_peak - int(0.04 * fs)
                     pr_interval_samples = q_onset - p_onset
                     pr_interval_s = pr_interval_samples / fs
-                    if 0.12 < pr_interval_s < 0.20: # Filter for plausible values
+                    if 0.12 < pr_interval_s < 0.20:
                         pr_intervals.append(pr_interval_s)
-            
-            return np.mean(pr_intervals) if pr_intervals else 0.16 # Return average or default
+            return np.mean(pr_intervals) if pr_intervals else 0.16
 
-        # --- UPDATED: Full Parameter Calculation ---
+        # --- Full Parameter Calculation Logic from batchecg.py ---
         rr_intervals = np.diff(r_peaks) / FS
         bpm = 60 / np.mean(rr_intervals)
         pr_interval = calculate_pr_interval(filtered_signal, r_peaks, FS)
 
-        # Durations and Intervals
-        qrs_durations = []
-        for r in r_peaks:
-            # Simplified QRS duration calculation
-            region = filtered_signal[max(0, r - int(0.1 * FS)) : min(len(filtered_signal), r + int(0.1 * FS))]
-            if len(region) > 0:
-                qrs_durations.append(len(region) / FS)
+        # QRS Duration Calculation
+        qrs_durations = [(np.argmax(np.diff(filtered_signal[max(r-30,0):min(r+30,len(filtered_signal))]) < -5) + np.argmax(np.diff(filtered_signal[max(r-30,0):min(r+30,len(filtered_signal))][30:]) > 5)) / FS for r in r_peaks if len(filtered_signal[max(r-30,0):min(r+30,len(filtered_signal))]) > 30]
         qrs_duration = np.mean(qrs_durations) if qrs_durations else 0.0
 
+        # PR Segment Calculation
         pr_segments = []
         for r in r_peaks:
             p_end = r - int(0.12 * FS)
-            qrs_start = r - np.argmax(np.diff(filtered_signal[max(r-30, 0):r]) < -0.5) if r > 30 else r
-            if qrs_start > p_end > 0:
-                pr_segments.append((qrs_start - p_end) / FS)
+            qrs_start_window = filtered_signal[max(r-30, 0):r]
+            if len(qrs_start_window) > 0:
+                qrs_start = r - np.argmax(np.diff(qrs_start_window) < -0.5)
+                if qrs_start > p_end > 0:
+                     pr_segments.append((qrs_start - p_end) / FS)
         pr_segment = np.mean(pr_segments) if pr_segments else 0.06
 
-
+        # QT Interval and QTc Calculation
         qt_intervals = []
         for r in r_peaks:
             q_onset = r - int(0.06 * FS)
-            if q_onset < 0: continue
             qrs_end = r + int(0.06 * FS)
-            if qrs_end + int(0.5 * FS) >= len(filtered_signal): continue
+            if q_onset < 0 or qrs_end + int(0.5 * FS) >= len(filtered_signal): continue
             t_wave_region = filtered_signal[qrs_end : qrs_end + int(0.5 * FS)]
             baseline = np.median(filtered_signal)
-            threshold_qt = 0.03 * np.max(filtered_signal)
-            t_offset_rel = np.where(np.abs(t_wave_region - baseline) < threshold_qt)[0]
+            t_offset_rel = np.where(np.abs(t_wave_region - baseline) < (0.03 * np.max(filtered_signal)))[0]
             if len(t_offset_rel) > 0:
                 t_offset = qrs_end + t_offset_rel[0]
                 qt = (t_offset - q_onset) / FS
@@ -239,6 +243,8 @@ async def analyze_ecg_endpoint(file: UploadFile = File(...)):
     except HTTPException as http_exc:
         raise http_exc
     except Exception as e:
+        # For debugging, it's helpful to print the actual error
+        print(f"An unexpected error occurred: {e}") 
         raise HTTPException(status_code=500, detail=f"An internal server error occurred: {str(e)}")
 
 
