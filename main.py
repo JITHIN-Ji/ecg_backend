@@ -36,7 +36,7 @@ app = FastAPI(title="Bharat Cardio API")
 # to communicate with this backend API.
 app.add_middleware(
     CORSMiddleware,
-    allow_origins=["http://localhost:3000"],
+    allow_origins=["https://ecg-frontend.onrender.com"],
     allow_credentials=True,
     allow_methods=["*"],
     allow_headers=["*"],
